@@ -1,0 +1,717 @@
+from mesa import Agent, Model
+from mesa.time import RandomActivation, BaseScheduler, SimultaneousActivation
+from mesa.space import MultiGrid
+from mesa.visualization.modules import CanvasGrid, ChartModule
+from mesa.visualization.ModularVisualization import ModularServer
+from mesa.datacollection import DataCollector
+
+import pandas as pd
+import numpy as np
+import os
+import json
+import random
+import folium
+import matplotlib.pyplot as plt
+from scipy.spatial import distance
+import time
+import logging
+import cProfile
+
+# Ensure the Logs directory exists
+log_dir = 'Logs'
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# Delete all logs that exist in the Logs directory
+for file in os.listdir(log_dir):
+    file_path = os.path.join(log_dir, file)
+    if os.path.isfile(file_path):
+        os.remove(file_path)
+
+# Set up basic logging configuration
+log_path = os.path.join(log_dir, 'potato_simulation.log')
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s -%(name)s - %(levelname)s - %(message)s',
+                    filename=log_path,
+                    filemode='w')
+
+# Set the logging level for matplotlib to WARNING to suppress DEBUG and INFO logs
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
+########################################################################################################################
+# Data Collection Functions
+########################################################################################################################
+def compute_total_weight(model):
+    total_weight = 0
+    for area in model.schedule.agents:
+        if isinstance(area, PotatoProductionArea):
+            total_weight += area.compute_total_weight()
+    return total_weight
+
+
+########################################################################################################################
+# Agent Classes
+########################################################################################################################
+
+### Base Agent Class ###
+class BaseAgent:
+    def __init__(self, unique_id, model):
+        self.unique_id = unique_id
+        self.model = model
+
+##################################################
+#Potato Production Area Agent Subclass
+class PotatoProductionArea(BaseAgent):
+    #potato_weight_lbs = 0.2
+    #conversion_factor_cwt = potato_weight_lbs / 100
+    desired_cwt_per_acre = 4
+    weight_per_agent_in_cwt = 1000
+    first_potato_logged = False
+
+    @property
+    def acres_per_potato_agent(self):
+        desired_cwt_per_acre = PotatoProductionArea.desired_cwt_per_acre
+        weight_per_agent_in_cwt = PotatoProductionArea.weight_per_agent_in_cwt
+        return weight_per_agent_in_cwt / desired_cwt_per_acre
+    
+    def __init__(self, unique_id, model, acres, name, owner, state, latitude, longitude, raw_water_agent):
+        super().__init__(unique_id, model)
+        self.name = name
+        self.acres = acres
+        self.potatoes = []
+        self.owner = owner
+        self.state = state
+        self.latitude = latitude
+        self.longitude = longitude
+        self.potatoes_planted = False
+        self.agent_type = 'PotatoProductionArea'
+        self.raw_water_agent = raw_water_agent
+        self.potato_count = 0
+        self.total_water_demand = 0
+        self.total_weight = 0
+        self.dead_potatoes_weight = 0
+        self.water_consumed = 0
+        self.potatoes_ready_for_harvest = 0
+        
+        print(f"Production Area Name: {self.name}, Acres: {self.acres}")
+
+    def pre_plant_irrigation(self):
+        field_capacity = 0.18  
+        desired_moisture_fraction = random.uniform(0.7, 0.8)
+        current_moisture_fraction = random.uniform(0.2,0.8)  
+        soil_depth = 1  
+        required_moisture_fraction = desired_moisture_fraction - current_moisture_fraction
+        water_needs_acre_foot = self.acres * required_moisture_fraction * field_capacity * soil_depth
+        water_needs_gallons = water_needs_acre_foot * 325851
+            
+        return water_needs_gallons
+    
+    def plant_potatoes(self):
+        desired_lbs_per_agent = self.weight_per_agent_in_cwt * 100  # Each agent represents 1000 cwt.
+        
+        # Represented acres by each potato agent, using the property
+        total_agents_for_production_area = int(self.acres / self.acres_per_potato_agent)
+        
+        for agent_num in range(total_agents_for_production_area):
+            accumulated_seed_weight = desired_lbs_per_agent
+            potato = Potato(unique_id=f"{self.unique_id}_{self.potato_count}", 
+                        model=self.model, 
+                        initial_water_needs=0,  # Set to 0 since we're not calculating pre-plant water needs
+                        seed_weight=accumulated_seed_weight,
+                        production_area=self)
+        
+            # Log only for the first potato 
+            if agent_num == 0 and not PotatoProductionArea.first_potato_logged:
+                potato.is_first = True
+                potato.setup_logger()
+                potato.tracked_logger.debug(f'For Potato {potato.unique_id}, seed_weight_lbs is {accumulated_seed_weight}.')
+                PotatoProductionArea.first_potato_logged = True
+            
+            self.potatoes.append(potato)
+            self.model.schedule.add(potato)
+            self.potato_count += 1
+            
+        print(f"Planted {len(self.potatoes)} potato agents (each representing {PotatoProductionArea.weight_per_agent_in_cwt} cwt) in {self.name} owned by {self.owner}.")
+
+    def average_plants_per_acre(self):
+        return self.potato_count / self.acres
+
+    def notify_water_demand(self, potato, amount):
+        self.total_water_demand += amount
+    
+    def notify_weight_increase(self, weight_increase):
+        """Adjusts the total weight in the production area when a potato grows."""
+        self.total_weight += weight_increase
+
+    def adjust_weight_after_death(self, weight_lost):
+        """Adjusts the total weight in the production area when a potato dies."""
+        self.total_weight -= weight_lost
+        self.dead_potatoes_weight += weight_lost
+
+    def consume_water(self, water_amount):
+        self.water_consumed += water_amount
+
+    def find_nearest_storage(self):
+        # calculate the distance to each storage facility
+        distances = {}
+        for storage in self.model.storage_agents:
+            if storage.current_volume < storage.capacity:
+                dist = ((self.latitude - storage.location[0]) ** 2 + (self.longitude - storage.location[1]) ** 2) ** 0.5
+                distances[storage] = dist
+
+        # return the nearest storage with available capacity or None if all are full
+        return min(distances, key=distances.get, default=None)
+
+    def potato_ready_for_harvest(self, potato):
+        self.potatoes_ready_for_harvest += 1
+        if self.potatoes_ready_for_harvest == len(self.potatoes):  # All potatoes are ready
+            self.call_for_harvest()
+
+    def call_for_harvest(self):
+        potatoes_to_harvest = [potato for potato in self.potatoes if potato.storage_state == "Growing"]
+        total_weight_to_harvest = sum([potato.weight for potato in potatoes_to_harvest])
+
+        nearest_storage = self.find_nearest_storage()
+        if nearest_storage is None:
+            # If there's no storage facility available, send to 'Export'
+            self.model.export_bin_volume += total_weight_to_harvest
+        else:
+            space_in_storage = nearest_storage.capacity - nearest_storage.current_volume
+
+            if space_in_storage >= total_weight_to_harvest:
+                nearest_storage.add_potatoes(total_weight_to_harvest)
+                self.total_weight -= total_weight_to_harvest
+            else:
+                # If not enough space in storage, add as much as possible and send the rest to 'Export'
+                nearest_storage.add_potatoes(space_in_storage)
+                self.model.export_bin_volume += (total_weight_to_harvest - space_in_storage)
+                self.total_weight -= space_in_storage
+
+        # Mark potatoes as harvested and remove them from the simulation
+        for potato in potatoes_to_harvest:
+            potato.mark_as_harvested()
+
+    def reset_attributes_for_new_cycle(self):
+        # Reset attributes related to potatoes
+        #for potato in self.potatoes:
+           #potato.reset_attributes()  # Define a reset_attributes method in the Potato class to reset individual potato attributes
+
+        # Reset attributes of the production area
+        self.total_weight = 0
+        self.dead_potatoes_weight = 0
+        self.water_consumed = 0
+        self.potatoes_ready_for_harvest = 0
+        # ... (any other attributes that need to be reset)
+
+        # Potentially reset attributes in the associated RawWater agent
+        #self.raw_water_agent.reset_water_supply()
+
+    def step(self):
+        if self.model.schedule.time % 365 == 0:
+            self.potatoes_planted = False
+            self.reset_attributes_for_new_cycle()
+
+        if not self.potatoes_planted:
+            # Request water for pre-planting irrigation
+            pre_plant_water_needed = self.pre_plant_irrigation()
+            water_received_for_preplant = self.raw_water_agent.supply_water(pre_plant_water_needed)
+            self.consume_water(water_received_for_preplant)
+            
+            # Check if received water is less than what's needed
+            if water_received_for_preplant < pre_plant_water_needed:
+                print(f"Not enough water for pre-plant irrigation in {self.name}. Skipping planting this step.")
+                return  # Exit the current step
+            
+            # Plant potatoes after receiving sufficient water for pre-plant irrigation
+            self.plant_potatoes()
+            self.potatoes_planted = True
+            
+        # After all potatoes have made their requests, fetch water
+        water_received = self.raw_water_agent.supply_water(self.total_water_demand)
+        total_water_needs = sum([potato.water_needs for potato in self.potatoes])
+        
+        for potato in self.potatoes:
+            if total_water_needs == 0:  # To avoid division by zero
+                water_allocated = water_received / len(self.potatoes)
+            else:
+                water_allocated = (potato.water_needs / total_water_needs) * water_received
+            potato.receive_water(water_allocated)
+            self.consume_water(water_allocated)
+
+        self.total_weight = sum([potato.weight for potato in self.potatoes])
+
+################################################
+###Potato Agent Subclass###
+class Potato(BaseAgent):
+  
+    GROWTH_STAGES = ["Germination", "Vegetative", "Tubering", "Maturation", "Harvest Ready"]
+    AREA_PER_POTATO_SQFT = 1
+    DROUGHT_THRESHOLD = 7  # Days without sufficient water before dying
+    DEFAULT_GROWTH_RATE = 0.05
+    EPSILON = 1e-10  # Small constant to prevent division by zero
+
+    def __init__(self, unique_id, model, seed_weight, production_area, growth_rate=DEFAULT_GROWTH_RATE, initial_water_needs=0):
+        super().__init__(unique_id, model)
+        self.weight = seed_weight
+        growth_multiplier = np.random.uniform(1,1.5)
+        self.growth_stage = 0
+        self.water_needs = initial_water_needs
+        self.days_in_current_stage = 0
+        self.alive = True
+        self.agent_type = 'Potato'
+        self.current_water_supply = 0
+        self.time_stages = self.generate_time_stages()  # Generate the random time stages
+        #self.time_stages.append(14)  # Adding 14 days for the final stage
+        self.max_weight = self.weight * growth_multiplier
+        self.growth_rate = growth_rate  # Now using the parameterized growth rate
+        self.week_in_stage = 0
+        self.days_without_sufficient_water = 0
+        self.production_area = production_area  # Storing the reference to the associated PotatoProductionArea
+        self.logger = logging.getLogger('Potato')
+        self.first_potato_id = None
+        self.is_first = False
+        self.harvestable = False
+        self.status = 'Growing'
+    
+    def setup_logger(self):
+        if self.is_first:
+            self.tracked_logger = logging.getLogger(f"TrackedPotato_{self.unique_id}")
+            self.tracked_logger.setLevel(logging.DEBUG)
+            fh = logging.FileHandler(f'Logs/tracked_{self.unique_id}.log', mode='w')
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            fh.setFormatter(formatter)
+            self.tracked_logger.addHandler(fh)
+
+    def water_needs_for_stage(self, growth_stage):
+        """ Returns the daily water needs based on the growth stage and week in that stage in gallons. """
+        
+        # Step 1: Calculate water needs in inches/day based on growth stage
+        if growth_stage == 0:  # Germination
+            water_needs_inches = 0  # No additional irrigation after initial pre-plant irrigation
+
+        elif growth_stage == 1:  # Vegetative
+            # Start with 0.071 inches/day and increase by 0.071 inches/day every week until 0.214 inches/day
+            water_needs_inches = min(0.214, 0.071 + (self.week_in_stage * 0.071))
+
+        elif growth_stage == 2:  # Tubering
+            water_needs_inches = 0.286
+
+        elif growth_stage == 3:  # Maturation
+            water_needs_inches = 0.321 * (0.9 ** self.week_in_stage)
+
+        elif growth_stage == 4:  # Harvest Ready
+            water_needs_inches = 0.00  # Replace with the correct value for the Harvest Ready stage
+
+        else:
+            raise ValueError("Invalid growth stage provided.")
+
+        # Step 2: Convert the water needs from inches/acre/day to gallons/acre/day
+        gallons_per_acre_per_day = water_needs_inches * 325829  # Corrected the multiplication here
+
+        # Step 3: Determine total gallons/day for the area represented by the agent
+        acres_represented_by_agent = self.production_area.acres_per_potato_agent
+        total_gallons_per_day = gallons_per_acre_per_day * acres_represented_by_agent
+        
+        if hasattr(self, 'is_first') and self.is_first:
+            self.tracked_logger.debug(
+                f'Potato {self.unique_id} at growth stage {self.GROWTH_STAGES[self.growth_stage]} (week {self.week_in_stage}) '
+                f'calculated water needs as: '
+                f'\n - {water_needs_inches} inches/day '
+                f'\n - {gallons_per_acre_per_day} gallons/acre/day '
+                f'\n - Representing {acres_represented_by_agent} acres '
+                f'\n - Total of {total_gallons_per_day} gallons/day '
+                f'on step {self.model.schedule.time}.'
+            )
+        return total_gallons_per_day
+        
+    def generate_time_stages(self):
+        # Define the mean and stddev for each stage (values can be adjusted)
+        stage_parameters = [(22.5, 7.5), (22.5, 7.5), (37.5, 22.5), (22.5, 7.5)]
+        
+        time_stages = [int(np.random.normal(mean, stddev)) for mean, stddev in stage_parameters]
+        
+        # Constrain the values within the defined limits for each stage
+        time_stages = [min(30, max(15, time_stages[0])), #Germination
+                    min(30, max(15, time_stages[1])),   #Vegetation
+                    min(60, max(15, time_stages[2])), #Tubering
+                    min(30, max(15, time_stages[3]))] #Maturation
+        time_stages.append(14) # Adding 14 days for skin hardening in the ground before harvest
+    
+        return time_stages
+
+    
+    def calculate_growth(self):
+        # Logistic growth function implementation
+        t_max = sum(self.time_stages)  # Total time to reach maximum growth
+        L = self.max_weight  # Carrying capacity or final weight
+        k = self.growth_rate * (self.current_water_supply / (self.water_needs + self.EPSILON))  # Growth rate adjusted by water supply, prevent division by zero
+        t = sum(self.time_stages[:self.growth_stage]) + self.days_in_current_stage  # Current time in the simulation
+        if hasattr(self, 'is_first') and self.is_first:
+            self.logger.debug(f"Values before calculating growth: k={k}, t={t}, L={L}, current_weight={self.weight}")
+
+        self.weight = L / (1 + (L - self.weight) / self.weight * np.exp(-k * t))
+        if hasattr(self, 'is_first') and self.is_first:
+            self.tracked_logger.debug(f'Potato {self.unique_id} grew to weight {self.weight} on step {self.model.schedule.time}.')
+
+    def time_to_next_stage(self, growth_stage):
+        return self.time_stages[growth_stage]
+
+    def receive_water(self, water_amount):
+        self.logger.debug(f'Received {water_amount} units of water.')
+        self.current_water_supply += water_amount
+        # Logging received water and new water supply
+        if hasattr(self, 'is_first') and self.is_first:
+            self.logger.debug(f'Potato {self.unique_id} has current water supply of {self.current_water_supply} units on step {self.model.schedule.time}.')
+
+    def transition_growth_stage(self):
+        """Move to the next growth stage if the duration exceeds the defined time for the current stage."""
+            # Check if the agent's time in the current growth stage exceeds the specified time for that stage
+        while self.days_in_current_stage >= self.time_stages[self.growth_stage]:
+            
+            # If there's a next growth stage, transition to it
+            if self.growth_stage < len(self.GROWTH_STAGES) - 1:
+                self.growth_stage += 1
+                self.days_in_current_stage = 0
+                self.week_in_stage = 0
+                    
+                # Log the transition if this potato is the first one (for logging purposes)
+                if hasattr(self, 'is_first') and self.is_first:
+                    self.tracked_logger.info(f'Potato {self.unique_id} transitioned to {self.GROWTH_STAGES[self.growth_stage]} stage on step {self.model.schedule.time}.')
+                
+            # If there's no next growth stage, break out of the loop to prevent an infinite loop
+            else:
+                break
+
+        # Check for the "Harvest Ready" stage:
+        if self.growth_stage == 4 and self.days_in_current_stage == 14:
+            self.production_area.potato_ready_for_harvest(self)
+
+    def die(self):
+        self.alive = False
+        # Notify the PotatoProductionArea of the death so it can adjust its weight calculations directly here
+        self.production_area.adjust_weight_after_death(self.weight)
+        if hasattr(self, 'is_first') and self.is_first:
+            self.tracked_logger.error(f'Potato {self.unique_id} died due to lack of water on step {self.model.schedule.time}.')
+
+    def notify_potato_death(self, weight_lost):
+        # Assuming you have a reference to the PotatoProductionArea agent. Adjust as needed.
+        self.production_area.adjust_weight_after_death(weight_lost)
+
+    def mark_as_harvested(self):
+        self.status = "In Storage"
+        self.model.schedule.remove(self)
+
+    def step(self):
+        if not self.alive:
+            return
+
+        # If the potato is ready for harvest, it shouldn't grow or request water.
+        if not self.harvestable:
+            # Inform the PotatoProductionArea of the water need
+            self.water_needs = self.water_needs_for_stage(self.growth_stage)
+            self.production_area.notify_water_demand(self, self.water_needs)
+            
+            # Calculate water needs
+            self.current_water_supply -= self.water_needs
+            self.current_water_supply = max(0, self.current_water_supply)  # Ensure the water doesn't go negative
+
+            # Check if the potato is getting enough water
+            if self.current_water_supply < self.water_needs:
+                self.days_without_sufficient_water += 1
+                if hasattr(self, 'is_first') and self.is_first:
+                    self.tracked_logger.warning(f'Potato {self.unique_id} has not received enough water for {self.days_without_sufficient_water} days on step {self.model.schedule.time}.')
+            else:
+                self.days_without_sufficient_water = 0  # Reset the counter if the potato gets enough water
+
+            # Introduce a drought stress or death mechanism
+            # If a potato doesn't receive sufficient water for 7 days in a row, it dies.
+            if self.days_without_sufficient_water >= self.DROUGHT_THRESHOLD:
+                self.die()
+                return
+
+            # Adjust water needs every week (assuming a week is 7 steps) for specific growth stages.
+            if self.model.schedule.time % 7 == 0 and self.growth_stage in [1, 3]:
+                self.water_needs *= 1.05  # Placeholder: Increase by 5% every week. Adjust based on real-world dynamics.
+
+            # Calculate growth at the beginning of each step
+            self.calculate_growth()
+
+        # Check if it's time to transition to a new growth stage
+        self.days_in_current_stage += 1
+
+        # Increment week counter
+        if self.days_in_current_stage % 7 == 0:
+            self.week_in_stage += 1
+
+        self.transition_growth_stage()  
+
+##############################################
+#Raw Water Agent Subclass
+class RawWater(BaseAgent):
+    def __init__(self, unique_id, model, name, water_capacity=float('inf'), facility_type=None, location=None, disruption_percentage=0):
+        super().__init__(unique_id, model)
+        self.name = name
+        self.facility_type = facility_type
+        self.water_capacity = water_capacity  # Only using water capacity now
+        self.disruption_percentage = disruption_percentage
+        self.status = "Normal"
+        self.location = location
+        self.agent_type = 'Raw Water'
+        self.baseline_water_use = 0
+
+    def supply_water(self, demand):
+        """
+        Supplies water based on the demand. Returns the amount of water actually supplied which can be less than the demand if capacity is limited.
+        """
+        # Calculate the actual water supplied (could be less than demand due to total capacity)
+        supplied_water = min(demand, self.water_capacity * (1 - self.disruption_percentage / 100))
+        
+        if self.model.schedule.time < 365:
+            self.baseline_water_use += supplied_water
+            
+        # Reduce the current water capacity
+        self.water_capacity -= supplied_water
+        
+        # Logging
+        logging.debug(f"{self.name} - Water Requested: {demand}, Water Supplied: {supplied_water}, Remaining Capacity: {self.water_capacity}")
+        return supplied_water
+
+    def introduce_disruption(self, percentage):
+        """
+        Introduces a disruption in the form of reducing the available water capacity.
+        """
+        self.disruption_percentage = percentage
+
+    def step(self):
+        """
+        Steps the RawWater agent. This could include events like natural replenishment of water.
+        """
+        if self.model.schedule.time == 365:  # or some other condition
+            self.introduce_disruption(10)  # Disrupting the water availability completely
+            # Reset water capacity to baseline usage and introduce disruption
+            self.water_capacity = self.baseline_water_use * (1 - self.disruption_percentage/100)
+
+
+################################################
+# Storage Facility Agent Subclass
+class Storage(BaseAgent):
+
+    def __init__(self, unique_id, model, name, facility_type, location, capacity):
+        super().__init__(unique_id, model)
+        self.name = name
+        self.facility_type = facility_type
+        self.location = location
+        self.capacity = capacity
+        self.current_volume = 0
+        self.weight_in_storage = 0  
+        self.agent_type = "Storage"
+
+    def add_potatoes(self, total_weight):
+        """Method to add potatoes to the storage, updating the current volume and total weight."""
+        self.current_volume += total_weight  # Assuming weight and volume are directly proportional
+        self.weight_in_storage += total_weight
+
+
+    def remove_potatoes(self, weight):
+        """Method to remove potatoes from the storage, updating the current volume and total weight."""
+        self.current_volume = max(0, self.current_volume - weight)
+        self.weight_in_storage = max(0, self.weight_in_storage - weight)  
+
+##################################################################################################
+### Main Model Class ###
+######################################################################################################
+class PotatoSupplyChain(Model):
+
+    def __init__(self):
+        self.schedule = RandomActivation(self)
+        self.running = True
+        self.export_bin_volume = 0
+
+        # Initialize agents
+        self.initialize_raw_water_agents()
+        self.initialize_production_areas()
+        self.initialize_storage_agents()
+
+        self.datacollector = DataCollector(
+            model_reporters={
+                "Total_Weight_1000cwt": lambda m: m.compute_global_total_weight() / 1000,
+                "Weights_by_Production_Area_1000cwt": lambda m: {area.unique_id: area.total_weight / 100 for area in m.production_areas},
+                "Dead_Potatoes_Weight_1000cwt": lambda m: sum(area.dead_potatoes_weight for area in m.production_areas) / 100,
+                "Water_Consumption": lambda m: sum(area.water_consumed for area in m.production_areas),
+                "Total_Storage": self.compute_total_storage,
+            }
+        )
+
+    def initialize_raw_water_agents(self):
+        with open('./AHAJson/rawWater.json') as file:
+            raw_water_data = json.load(file)
+        self.raw_water_agents = [
+            RawWater(unique_id=item['id'], model=self, name=item['name'],
+                     facility_type=item['facilityTypeName'],
+                     location=(item['latitude'], item['longitude'])) for item in raw_water_data
+        ]
+
+    def initialize_production_areas(self):
+        with open('./AHAJSON/potatoProductionAreas.json') as file:
+            data = json.load(file)
+
+        total_acres = 328858
+        num_agents = len(data)
+        base_acres_per_agent = total_acres // num_agents
+        remaining_acres = total_acres - base_acres_per_agent * num_agents
+
+        self.production_areas = []
+        for item in data:
+            extra_acres = random.randint(0, remaining_acres // 2)
+            remaining_acres -= extra_acres
+            acres_assigned = base_acres_per_agent + extra_acres
+            closest_water_agent = self.find_closest_water_agent(item['latitude'], item['longitude'], self.raw_water_agents)
+            agent = PotatoProductionArea(
+                unique_id=item['id'],
+                model=self, 
+                acres=acres_assigned,
+                name=item['name'],
+                owner=item['owner'],
+                state=item['state'],
+                latitude=item['latitude'],
+                longitude=item['longitude'],
+                raw_water_agent=closest_water_agent
+            )
+            self.production_areas.append(agent)
+            self.schedule.add(agent)
+
+        if remaining_acres > 0:
+            random_agent = random.choice(self.production_areas)
+            random_agent.acres += remaining_acres
+
+        active_raw_water_agents = set(area.raw_water_agent for area in self.production_areas)
+        for agent in active_raw_water_agents:
+            self.schedule.add(agent)
+
+    def initialize_storage_agents(self):
+        with open('./AHAJSON/StorageFacilities.json') as file:
+            storage_facility_data = json.load(file)
+        self.storage_agents = [
+            Storage(unique_id=item['id'], model=self, name=item['name'],
+                    facility_type=item['facilityTypeName'],
+                    location=(item['latitude'], item['longitude']),
+                    capacity=item['specificProperties']['storagecapacitycwt']) for item in storage_facility_data
+        ]
+
+    def compute_total_storage(self):
+        return sum(storage.current_volume for storage in self.storage_agents)
+
+    def compute_global_total_weight(self):
+        return sum(area.total_weight for area in self.production_areas)
+
+    def find_closest_water_agent(self, latitude, longitude, raw_water_agents):
+        closest_distance = float('inf')
+        closest_water_agent = None
+        for water_agent in raw_water_agents:
+            dist = distance.euclidean((latitude, longitude), water_agent.location)
+            if dist < closest_distance:
+                closest_distance = dist
+                closest_water_agent = water_agent
+        return closest_water_agent
+
+    def check_running_status(self):
+        for agent in self.schedule.agents:
+            if isinstance(agent, Potato):
+                if agent.growth_stage != len(Potato.GROWTH_STAGES) - 1 and agent.alive:
+                    return True  # Continue running if there are still potatoes growing
+        self.running = False
+        return False
+
+    def step(self):
+        self.datacollector.collect(self)
+        self.schedule.step()
+        self.check_running_status()
+
+#################################################################################################################
+#Run the Model
+##############################################################################################################
+def run_model():
+    model = PotatoSupplyChain()
+
+    while model.running:
+        for i in range(731):
+            model.step()
+
+
+    data = model.datacollector.get_model_vars_dataframe()
+    data.to_json('./AHAJSON/Model_output.json')
+
+
+####################################################################################################################
+# Plot Graphs
+# ################################################################################################################## 
+
+    # 1. Total Weight of Potatoes Over Time
+    data['Total_Weight_1000cwt'].plot()
+    plt.title('Total Weight of Potatoes Over Time (in 1000 cwt)')
+    plt.xlabel('Time (steps)')
+    plt.ylabel('Total Weight (in 1000 cwt)')
+    plt.show()
+
+    # 2. Weights by Individual Production Areas Over Time
+    weights_by_area = data['Weights_by_Production_Area_1000cwt'].apply(pd.Series)
+    weights_by_area.plot(legend=False)  # Setting legend to False to avoid overcrowding, adjust as needed
+    plt.title('Weights by Individual Production Areas Over Time (in 1000 cwt)')
+    plt.xlabel('Time (steps)')
+    plt.ylabel('Weight (in 1000 cwt)')
+    plt.show()
+
+    # 3. Dead Potatoes Weight Over Time
+    data['Dead_Potatoes_Weight_1000cwt'].plot()
+    plt.title('Total Dead Potatoes Weight Over Time (in 1000 cwt)')
+    plt.xlabel('Time (steps)')
+    plt.ylabel('Dead Potatoes Weight (in 1000 cwt)')
+    plt.show()
+
+    # 4. Water Consumption Over Time
+    data['Water_Consumption'].plot()
+    plt.title('Water Consumption Over Time')
+    plt.xlabel('Time (steps)')
+    plt.ylabel('Water Consumed')
+    plt.show()
+
+    # 5. Storage
+    data['Total_Storage'].plot()
+    plt.title('Storage Capacity')
+    plt.xlabel('Time (steps)')
+    plt.ylabel('Potatoes Stored')
+    plt.show()
+
+if __name__ == "__main__":
+    cProfile.run('run_model()', filename='profile_output.txt')
+'''
+############################################################################################################################
+#MESA Visualization
+############################################################################################################################
+area_ids = [area.unique for area in model.production_areas]
+#Error: area_ids = [area.unique for area in model.production_areas]
+AttributeError: 'PotatoProductionArea' object has no attribute 'unique'
+
+# Generate color list
+num_areas = len(area_ids)
+colormap = plt.cm.tab20
+colors = [colormap[1] for i in range(num_areas)]
+
+#Convert to hex codes
+hex_colors = [plt.colors.rgb2hex(color) for color in colors]
+
+chart_total_weight = ChartModule([{"Label": "Total_Weight_1000cwt", "Color": "Green"}],
+                                  data_collector_name='datacollector')
+
+chart_weight_by_area = ChartModule([{"Label": area_id, "Color": color} for area_id, color in zip(area_ids, hex_colors)],
+                                  data_collector_name='datacollector')
+
+chart_dead_potatoes = ChartModule([{"Label": "Dead_Potatoes_Weight_1000cwt", "Color": "Red"}],
+                                  data_collector_name='datacollector')
+
+chart_water_consumption = ChartModule([{"Label": "Water_Consumption", "Color": "Blue"}],
+                                  data_collector_name='datacollector')
+
+# When you initiate your server, add these ChartModules
+server = ModularServer(PotatoSupplyChain, [chart_total_weight, chart_weight_by_area, chart_dead_potatoes, chart_water_consumption], "Potato Supply Chain", {})
+'''
